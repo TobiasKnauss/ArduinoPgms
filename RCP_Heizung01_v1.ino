@@ -1,15 +1,18 @@
 #include <Streaming.h>
 #include <LiquidCrystal_I2C.h>
 #include <OneWire.h>
+#include <EEPROM.h>
 #include <CButton.h>
 #include <COutputPWM.h>
 #include <CDoubleOutput.h>
 #include <CTempDS18B20.h>
+#include <CEditScreen.h>
 
 //----------------------------------------------------------------------------
 enum EnumResult
 {
 #include "CommonErrors.h"
+  Error_SettingsInvalid,
   Error_TempSensor_Create,
   Error_TempSensor_Read,
 };
@@ -26,25 +29,28 @@ enum EnumButton
 //--------------------------------------
 enum EnumScreen
 {
-  ScrNone = 0,
-  ScrHome00_Status,
+  ScrNone                 = 0,
+  ScrHome00_Status        = 1,
   ScrHome01_TempOverview,
   ScrHome10_TempVorlauf,
   ScrHome11_TempWasser,
   ScrHome12_TempHeizung,
   ScrHome13_Temp04,
   ScrHome14_Temp05,
-  ScrMenu00,
-  ScrMenu01_TempWasser,
-  ScrMenu02_TempHeizung,
-  ScrMenu03_TempHysterese,
-  ScrMenu04_MischerStellzeit,
-  ScrMenu05_Pumpe,
-  ScrMenu06_Sensor1Adresse,
-  ScrMenu07_Sensor2Adresse,
-  ScrMenu08_Sensor3Adresse,
-  ScrService00,
+  ScrSet00                = 21,
+  ScrSet01_TempWasser,
+  ScrSet02_TempHeizung,
+  ScrSet03_TempHysterese,
+  ScrSet04_MischerStellzeit,
+  ScrSet05_Pumpe,
+  ScrSet06_Sensor1Adresse,
+  ScrSet07_Sensor2Adresse,
+  ScrSet08_Sensor3Adresse,
+  ScrService00            = 41,
   ScrService01_SensorSuche,
+  ScrSettingActive        = 91,
+  ScrSettingFirst         = ScrSet01_TempWasser,
+  ScrSettingLast          = ScrSet08_Sensor3Adresse,
 };
 
 //--------------------------------------
@@ -67,9 +73,17 @@ enum EnumOperation
 //----------------------------------------------------------------------------
 #define MAXTEMPCOUNT  10
 #define TEMPCOUNT     3
-const unsigned int mc_tIntervalWatchdog = 100;
-const unsigned int mc_tIntervalTempCtrl = 10000;
-const unsigned int mc_tTimeoutMenu      = 60000;
+const unsigned int  mc_tIntervalWatchdog =   100;
+const unsigned int  mc_tIntervalUpdateUI =  5000;
+const unsigned int  mc_tIntervalTempCtrl = 10000;
+const unsigned int  mc_tTimeoutMenu      = 60000;
+
+const float         mc_fTemperaturMax         = 100.0;
+const float         mc_fTemperaturMin         =  10.0;
+const float         mc_fHystereseMax          =  10.0;
+const float         mc_fHystereseMin          =   1.0;
+const unsigned int  mc_uiMischerStellzeitMax  = 600;
+const byte          mc_byPumpeLaufzeitMax     = 100;
 
 const int I2C_Addr_Display    = 0x27;
 
@@ -91,7 +105,7 @@ const int DO_LED_Fehler       =  7;
 float               m_fTWasserSoll    = 0.0;
 float               m_fTHeizungSoll   = 0.0;
 float               m_fTHysterese     = 0.0;
-int                 m_iMischerStellzeit = 140;
+unsigned int        m_uiMischerStellzeit = 0;
 byte                m_byPumpeLaufzeit = 0;  // [%]
 byte                m_aabyTempDS18B20Addr[TEMPCOUNT][8];
 
@@ -102,15 +116,18 @@ EnumOperation       m_enOpRequest     = EnumOperation::OpNone;
 unsigned long       m_tWatchdog       = 0;
 unsigned long       m_tTempCtrl       = 0;
 unsigned long       m_tLastMenuChange = 0;
+unsigned long       m_tLastUpdateUI   = 0;
 byte                m_byTempCtrlError = 0;
+bool                m_bDataChanged    = false;
 EnumScreen          m_enScreen        = EnumScreen::ScrHome00_Status;
 EnumButton          m_enLastButton    = EnumButton::BtnNone;
 LiquidCrystal_I2C   m_oDisplay (I2C_Addr_Display, 16, 2);
+CEditScreen         m_oEditScreen (&m_oDisplay, 16, true);
 OneWire             m_oOneWire (DI_TempDS18B20);
 CTempDS18B20*       m_aoTempSensor[TEMPCOUNT];
 COutputPWM          m_oPumpe (DO_Pumpe, false, 0, 100);
-CDoubleOutput       m_oMischer1KH (DO_Mischer1_Kreis,  DO_Mischer1_Heizen,  false, m_iMischerStellzeit * 1000, m_iMischerStellzeit * 1000);
-CDoubleOutput       m_oMischer2WH (DO_Mischer2_Wasser, DO_Mischer2_Heizung, false, m_iMischerStellzeit * 1000, m_iMischerStellzeit * 1000);
+CDoubleOutput       m_oMischer1KH (DO_Mischer1_Kreis,  DO_Mischer1_Heizen,  false, m_uiMischerStellzeit * 1000, m_uiMischerStellzeit * 1000);
+CDoubleOutput       m_oMischer2WH (DO_Mischer2_Wasser, DO_Mischer2_Heizung, false, m_uiMischerStellzeit * 1000, m_uiMischerStellzeit * 1000);
 float               m_fTVorlauf       = 0.0;
 float               m_fTWasser        = 0.0;
 float               m_fTHeizung       = 0.0;
@@ -126,8 +143,9 @@ void DisplayPrintRow (byte                       i_byRow,
 {
   if (i_poLine && i_byRow >= 1 && i_byRow <= 2)
   {
-    m_oDisplay.setCursor(i_byRow - 1, 0);
-    m_oDisplay << i_poLine << endl;
+    i_byRow--;
+    m_oDisplay.setCursor(0, i_byRow);
+    m_oDisplay << i_poLine;
   }
 }
 
@@ -160,7 +178,7 @@ void setup()
   //--------------------------------------
   m_enResult = SettingsRead ();
   if (m_enResult != EnumResult::SUCCESS) return;
-  
+/*  
   //--------------------------------------
   for (int ixCnt = 0; ixCnt < TEMPCOUNT; ixCnt++)
   {
@@ -171,7 +189,7 @@ void setup()
     Serial << F("new Temp sensor DS18B20, result=") << enResultDS18B20 << endl;
   }
   if (m_enResult != EnumResult::SUCCESS) return;
-
+*/
   //--------------------------------------
   DisplayPrint (F("Initialisierung"), F("abgeschlossen."));
   m_enResult = EnumResult::InProgress;
@@ -195,7 +213,7 @@ void loop()
     s_bWatchdog = !s_bWatchdog;
     digitalWrite (DO_Watchdog, s_bWatchdog);
   }
-
+/*
   if (tTime - m_tTempCtrl > mc_tIntervalTempCtrl)
   {
     enResult = TemperatureControl ();
@@ -204,20 +222,28 @@ void loop()
     else if (enResult != EnumResult::InProgress)
       m_enResult = enResult;
   }
-  
-  if (m_enResult != EnumResult::InProgress)
-  {
-    Serial << F("Error=") << m_enResult << endl;
-  }
+*/
   
   EnumButton enButton = EnumButton::BtnNone;
   ButtonRead (enButton);
-  if (enButton == m_enLastButton)
-    enButton = EnumButton::BtnNone;
+  if (enButton != m_enLastButton
+  &&  enButton != EnumButton::BtnNone
+  ||  tTime - m_tLastUpdateUI > mc_tIntervalUpdateUI)
+  {
+    if (m_enResult != EnumResult::InProgress)
+      Serial << F("Error=") << m_enResult << endl;
+    UpdateUI (enButton);
+    m_tLastUpdateUI = tTime;
+  }
   m_enLastButton = enButton;
-  
-  UpdateUI (enButton);
 
+  if (m_bDataChanged)
+  {
+    EnumResult enResultWrite = SettingsWrite ();
+    if (enResultWrite != EnumResult::SUCCESS)
+      m_enResult = enResultWrite; 
+  }
+  
   delay (10);
 }
 
@@ -336,13 +362,24 @@ void ButtonRead (EnumButton &o_enButton)
 //------------------------------------------------------------------------------
 void UpdateUI (EnumButton i_enButton)
 {
-  Serial << F("UpdateUI Button=") << i_enButton << endl;
+  Serial << F("UpdateUI() CurrentScreen=") << m_enScreen << F(", Button=") << i_enButton << F(", ");
 
+  //static EnumScreen s_enLastScreen    = EnumScreen::ScrHome00_Status;
+  static EnumScreen s_enEditScreen    = EnumScreen::ScrNone;
+  static bool       s_bSettingScreen  = false;
+  EnumScreen enScreenCurrent = m_enScreen;
+  
   if (i_enButton != EnumButton::BtnNone)
     m_tLastMenuChange = millis ();
   else if (millis() - m_tLastMenuChange > mc_tTimeoutMenu)
+  {
+    if (m_enScreen != EnumScreen::ScrHome00_Status)
+      Serial << F("Timeout, ");
     m_enScreen = EnumScreen::ScrHome00_Status;
-    
+  }
+
+  bool bEditStart = false;
+  
   //----------------------------------------
   // navigation
   switch (m_enScreen)
@@ -357,11 +394,11 @@ void UpdateUI (EnumButton i_enButton)
     switch (i_enButton)
     {
     case EnumButton::BtnMenu:
-      m_enScreen = EnumScreen::ScrMenu00;
+      m_enScreen = EnumScreen::ScrSet00;
       break;
     case EnumButton::BtnPlus:
       m_enScreen = (EnumScreen)(m_enScreen + 1);
-      if (m_enScreen > EnumScreen::ScrHome10_TempVorlauf + TEMPCOUNT)
+      if (m_enScreen >= EnumScreen::ScrHome10_TempVorlauf + TEMPCOUNT)
         m_enScreen = EnumScreen::ScrHome00_Status;
       break;
     case EnumButton::BtnMinus:
@@ -374,31 +411,31 @@ void UpdateUI (EnumButton i_enButton)
     }  
     break;
     
-  case EnumScreen::ScrMenu00:
+  case EnumScreen::ScrSet00:
     switch (i_enButton) {
     case EnumButton::BtnMenu:  m_enScreen = EnumScreen::ScrService00;     break;
-    case EnumButton::BtnPlus:  m_enScreen = EnumScreen::ScrMenu01_TempWasser; break;
-    case EnumButton::BtnMinus: m_enScreen = EnumScreen::ScrMenu08_Sensor3Adresse; break;
+    case EnumButton::BtnPlus:  m_enScreen = EnumScreen::ScrSet01_TempWasser; break;
+    case EnumButton::BtnMinus: m_enScreen = EnumScreen::ScrSet08_Sensor3Adresse; break;
     default: break;
     }
     break;
 
-  case EnumScreen::ScrMenu01_TempWasser:
-  case EnumScreen::ScrMenu02_TempHeizung:
-  case EnumScreen::ScrMenu03_TempHysterese:
-  case EnumScreen::ScrMenu04_MischerStellzeit:
-  case EnumScreen::ScrMenu05_Pumpe:
-  case EnumScreen::ScrMenu06_Sensor1Adresse:
-  case EnumScreen::ScrMenu07_Sensor2Adresse:
-  case EnumScreen::ScrMenu08_Sensor3Adresse:
+  case EnumScreen::ScrSet01_TempWasser:
+  case EnumScreen::ScrSet02_TempHeizung:
+  case EnumScreen::ScrSet03_TempHysterese:
+  case EnumScreen::ScrSet04_MischerStellzeit:
+  case EnumScreen::ScrSet05_Pumpe:
+  case EnumScreen::ScrSet06_Sensor1Adresse:
+  case EnumScreen::ScrSet07_Sensor2Adresse:
+  case EnumScreen::ScrSet08_Sensor3Adresse:
     switch (i_enButton) {
     case EnumButton::BtnMenu:
-      // TODO edit
+      bEditStart = true;
       break;
     case EnumButton::BtnPlus:
       m_enScreen = (EnumScreen)(m_enScreen + 1);
-      if (m_enScreen > EnumScreen::ScrMenu08_Sensor3Adresse)
-        m_enScreen = EnumScreen::ScrMenu00;
+      if (m_enScreen > EnumScreen::ScrSet08_Sensor3Adresse)
+        m_enScreen = EnumScreen::ScrSet00;
       break;
     case EnumButton::BtnMinus:
       m_enScreen = (EnumScreen)(m_enScreen - 1);
@@ -437,9 +474,27 @@ void UpdateUI (EnumButton i_enButton)
     break;
   }
 
+  bool bScreenChanged = (m_enScreen != enScreenCurrent);
+  Serial << F("NewScreen=") << m_enScreen << F(", ");
+
+  if (m_enScreen >= EnumScreen::ScrSettingFirst
+  &&  m_enScreen <= EnumScreen::ScrSettingLast
+  ||  m_enScreen == EnumScreen::ScrSettingActive)
+  {
+    s_bSettingScreen = true;
+  }
+  else if (s_bSettingScreen)
+  {
+    s_enEditScreen   = EnumScreen::ScrNone;
+    s_bSettingScreen = false;
+    m_oEditScreen.Update (CEditScreen::EnumAction::Clear);    
+  }
+  Serial << F("bSettingScreen=") << s_bSettingScreen << endl;
+  
   //----------------------------------------
   // view content
   EnumOperation enStatus = EnumOperation::OpNone;
+  
   switch (m_enScreen)
   {
   case EnumScreen::ScrHome00_Status:
@@ -448,7 +503,7 @@ void UpdateUI (EnumButton i_enButton)
       m_oDisplay.clear ();
       m_oDisplay.setCursor(0,0);
       m_oDisplay << F("Fehler ") << m_enResult;
-      m_oDisplay.setCursor(1,0);
+      m_oDisplay.setCursor(0,1);
     } 
     else if (m_enOpRequest != EnumOperation::OpNone) 
     {
@@ -476,47 +531,176 @@ void UpdateUI (EnumButton i_enButton)
     }
     break;
   case EnumScreen::ScrHome01_TempOverview:
-    DisplayPrint (F("T: Vor Wass Heiz"), 0);
-    m_oDisplay.setCursor(1,0);
+    DisplayPrint (F("T:Vorl Wass Heiz"), 0);
+    m_oDisplay.setCursor(0,1);
     m_oDisplay << String(m_fTVorlauf, 1).padLeftC(5)
                << String(m_fTWasser , 1).padLeftC(5)
                << String(m_fTHeizung, 1).padLeftC(5);
     break;
   case EnumScreen::ScrHome10_TempVorlauf:
     DisplayPrint (F("S.1 T.Vorlauf"), 0);
-    m_oDisplay.setCursor(1,0);
+    m_oDisplay.setCursor(0,1);
     m_oDisplay << String(m_fTVorlauf, 1).padLeftC(5);
     break;
   case EnumScreen::ScrHome11_TempWasser:
     DisplayPrint (F("S.2 T.Wasser"), 0);
-    m_oDisplay.setCursor(1,0);
+    m_oDisplay.setCursor(0,1);
     m_oDisplay << String(m_fTWasser, 1).padLeftC(5) << " (" << String(m_fTWasserSoll, 1).padLeftC(4) << ")";
     break;
   case EnumScreen::ScrHome12_TempHeizung:
     DisplayPrint (F("S.3 T.Heizung"), 0);
-    m_oDisplay.setCursor(1,0);
+    m_oDisplay.setCursor(0,1);
     m_oDisplay << String(m_fTHeizung, 1).padLeftC(5) << " (" << String(m_fTHeizungSoll, 1).padLeftC(4) << ")";
     break;
   case EnumScreen::ScrHome13_Temp04:
   case EnumScreen::ScrHome14_Temp05:
     break;
 
+  case EnumScreen::ScrSet00:
+    DisplayPrint (F("Einstellungen"), 0);
+    break;
+  case EnumScreen::ScrSet01_TempWasser:
+    if (bScreenChanged)
+      m_oEditScreen.Show (F("T.Soll Wasser"), CEditScreen::EnumDataType::FLOAT, (byte*)&m_fTWasserSoll, mc_fTemperaturMax, mc_fTemperaturMin, 3, 1, false);
+    break;
+  case EnumScreen::ScrSet02_TempHeizung:
+    if (bScreenChanged)
+      m_oEditScreen.Show (F("T.Soll Heizung"), CEditScreen::EnumDataType::FLOAT, (byte*)&m_fTHeizungSoll, mc_fTemperaturMax, mc_fTemperaturMin, 3, 1, false);
+    break;
+  case EnumScreen::ScrSet03_TempHysterese:
+    if (bScreenChanged)
+      m_oEditScreen.Show (F("Temp. Hysterese"), CEditScreen::EnumDataType::FLOAT, (byte*)&m_fTHysterese, 10.0, 1.0, 2, 1, false);
+    break;
+  case EnumScreen::ScrSet04_MischerStellzeit:
+    if (bScreenChanged)
+      m_oEditScreen.Show (F("MischerStellzeit"), CEditScreen::EnumDataType::INT, (byte*)&m_uiMischerStellzeit, mc_uiMischerStellzeitMax, 1, 3, 0, false);
+    break;
+  case EnumScreen::ScrSet05_Pumpe:
+    if (bScreenChanged)
+      m_oEditScreen.Show (F("Pumpe Laufzeit %"), CEditScreen::EnumDataType::BYTE, &m_byPumpeLaufzeit, mc_byPumpeLaufzeitMax, 0, 3, 0, false);
+    break;
+  case EnumScreen::ScrSet06_Sensor1Adresse:
+    if (bScreenChanged)
+      m_oEditScreen.Show (F("S.1 Adresse"), CEditScreen::EnumDataType::BYTES, m_aabyTempDS18B20Addr[0], 0, 0, 8, 0, true);
+    break;
+  case EnumScreen::ScrSet07_Sensor2Adresse:
+    if (bScreenChanged)
+      m_oEditScreen.Show (F("S.2 Adresse"), CEditScreen::EnumDataType::BYTES, m_aabyTempDS18B20Addr[1], 0, 0, 8, 0, true);
+    break;
+  case EnumScreen::ScrSet08_Sensor3Adresse:
+    if (bScreenChanged)
+      m_oEditScreen.Show (F("S.3 Adresse"), CEditScreen::EnumDataType::BYTES, m_aabyTempDS18B20Addr[2], 0, 0, 8, 0, true);
+    break;
+   break;
+   
+  case EnumScreen::ScrService00:
+    DisplayPrint (F("Service-"), F("Funktionen"));
+    break;
+  case EnumScreen::ScrService01_SensorSuche:
+    DisplayPrint (F("Sensorsuche"), 0);
+    break;
+  
   default:
     break;
   }
+  CEditScreen::EnumAction enAction = CEditScreen::EnumAction::None;
+  if (bEditStart)
+  {
+    enAction = CEditScreen::EnumAction::EditStart;
+  }
+  else
+  {
+    switch (i_enButton) {
+      case EnumButton::BtnMenu:  enAction = CEditScreen::EnumAction::Select; break;
+      case EnumButton::BtnPlus:  enAction = CEditScreen::EnumAction::Increment; break;
+      case EnumButton::BtnMinus: enAction = CEditScreen::EnumAction::Decrement; break;
+      default: break;
+    }
+  }
+  if (m_oEditScreen.IsDataExist())
+    m_oEditScreen.Update (enAction);
+
+  if (m_oEditScreen.IsEditActive())
+  {
+    if (s_enEditScreen == EnumScreen::ScrNone)
+    {
+      s_enEditScreen  = m_enScreen;
+      m_enScreen      = ScrSettingActive;
+    }
+  }
+  else if (s_enEditScreen > EnumScreen::ScrNone)
+  {
+    m_enScreen      = s_enEditScreen;
+    s_enEditScreen  = EnumScreen::ScrNone;
+  }
+
+  m_bDataChanged = m_oEditScreen.IsDataChanged();
 }
 
 //------------------------------------------------------------------------------
 EnumResult SettingsRead ()
 {
+  EnumResult enResult = EnumResult::InProgress;
+  
   // read from EEPROM
-  return EnumResult::SUCCESS;
+  unsigned int uiPos = 0x10;
+  
+  EEPROM.get (uiPos, m_fTWasserSoll);
+  if (isnan(m_fTWasserSoll)) enResult = EnumResult::Error_SettingsInvalid;
+  if (m_fTWasserSoll < mc_fTemperaturMin || m_fTWasserSoll > mc_fTemperaturMax) enResult = EnumResult::Error_SettingsInvalid;
+  uiPos += sizeof(float);
+  
+  EEPROM.get (uiPos, m_fTHeizungSoll);
+  if (isnan(m_fTHeizungSoll)) enResult = EnumResult::Error_SettingsInvalid;
+  if (m_fTHeizungSoll < mc_fTemperaturMin || m_fTHeizungSoll > mc_fTemperaturMax) enResult = EnumResult::Error_SettingsInvalid;
+  uiPos += sizeof(float);
+  
+  EEPROM.get (uiPos, m_fTHysterese);
+  if (isnan(m_fTHysterese)) enResult = EnumResult::Error_SettingsInvalid;
+  if (m_fTHysterese < mc_fHystereseMin || m_fTHysterese > mc_fHystereseMax) enResult = EnumResult::Error_SettingsInvalid;
+  uiPos += sizeof(float);
+  
+  EEPROM.get (uiPos, m_uiMischerStellzeit);
+  if (m_uiMischerStellzeit > mc_uiMischerStellzeitMax) enResult = EnumResult::Error_SettingsInvalid;
+  uiPos += sizeof(int);
+  
+  EEPROM.get (uiPos, m_byPumpeLaufzeit);
+  if (m_byPumpeLaufzeit > mc_byPumpeLaufzeitMax) enResult = EnumResult::Error_SettingsInvalid;
+  uiPos += sizeof(byte);
+
+  uiPos &= 0xFFF0;
+  uiPos += 0x10;
+  
+  for (byte byxCnt = 0; byxCnt < TEMPCOUNT; byxCnt++)
+  {
+    Serial << F("Sensor ") << (byxCnt+1) << F(" reading from 0x") << String(uiPos, HEX);
+    for (byte byxByte = 0; byxByte < 8; byxByte++)
+    {
+      m_aabyTempDS18B20Addr[byxCnt][byxByte] = EEPROM.read (uiPos++);
+    }
+    byte byCRC = OneWire::crc8 (m_aabyTempDS18B20Addr[byxCnt], 7);
+    if (byCRC == m_aabyTempDS18B20Addr[byxCnt][7])
+      Serial << F(" successful.") << endl;
+    else
+    {
+      Serial << F(" CRC failure.") << endl;
+      enResult = EnumResult::Error_SettingsInvalid;
+    }
+    uiPos &= 0xFFF0;
+    uiPos += 0x10;
+  }
+  if (enResult == EnumResult::InProgress)
+    enResult = EnumResult::SUCCESS;
+    
+  return enResult;
 }
 
 //------------------------------------------------------------------------------
 EnumResult SettingsWrite ()
 {
   // write to EEPROM
+  
+  
   return EnumResult::SUCCESS;
 }
 
