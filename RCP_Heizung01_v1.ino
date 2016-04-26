@@ -70,6 +70,7 @@ enum EnumOperation
 {
   OpNone,
   Op_Trinkwasser = 1, // ab hier sortiert nach Priorität
+  Op_TrinkwasserVorbereitung,
   Op_Heizung,
   Op_Aus,
 };
@@ -167,7 +168,7 @@ void DisplayPrint (const __FlashStringHelper* i_poLine1,
 //------------------------------------------------------------------------------
 // setup
 //------------------------------------------------------------------------------
-void setup() 
+void setup()
 {
 #ifdef DEBUG_PROGRAM
   Serial.begin (9600);
@@ -175,7 +176,7 @@ void setup()
 
   //--------------------------------------
   pinMode (DI_Button, INPUT);
-  
+
   pinMode (DO_Watchdog, OUTPUT);
   pinMode (DO_LED_Fehler, OUTPUT);
 
@@ -227,12 +228,12 @@ void setup()
 //------------------------------------------------------------------------------
 // loop
 //------------------------------------------------------------------------------
-void loop() 
+void loop()
 {
   EnumResult        enResult        = EnumResult::InProgress;
   unsigned long     tTime           = millis ();
   static bool       s_bWatchdog     = false;
-  
+
   // Watchdog
   if ((m_enResult == EnumResult::InProgress && tTime - m_tWatchdog > mc_tIntervalWatchdog)
   ||  (m_enResult != EnumResult::InProgress && tTime - m_tWatchdog > mc_tIntervalWatchdog * 10))
@@ -248,11 +249,11 @@ void loop()
   {
     enResult = TemperatureControl ();
     if (enResult == EnumResult::SUCCESS)
-      m_tTempCtrl = tTime;      
+      m_tTempCtrl = tTime;
     else if (enResult != EnumResult::InProgress)
       m_enResult = enResult;
   }
-  
+
   EnumButton enButton = EnumButton::BtnNone;
   ButtonRead (enButton);
   if ((enButton != m_enLastButton && enButton != EnumButton::BtnNone)
@@ -290,7 +291,7 @@ void loop()
     break;
   }
   m_enAction = EnumAction::ActNone;
-  
+
   delay (10);
 }
 
@@ -331,7 +332,7 @@ EnumResult TemperatureControl ()
       s_byError++;
     if (s_byError >= 10) return s_enResult;
     s_enResult = EnumResult::InProgress;
-    
+
     if (m_fTHysterese <  1.0) m_fTHysterese =  1.0;
     if (m_fTHysterese > 10.0) m_fTHysterese = 10.0;
 
@@ -342,21 +343,31 @@ EnumResult TemperatureControl ()
     if (m_enOpRequest == EnumOperation::OpNone)
     {
       m_enOpRequest = m_enOpStatus;
-      
-      // Prüfung Anforderung Trinkwasser
+
+      // Prüfung Anforderung "Trinkwasser"
       if (m_enOpRequest == EnumOperation::Op_Trinkwasser
-      && (m_fTWasser > m_fTWasserSoll + m_fTHysterese || m_fTVorlauf < m_fTWasser))
+      && (m_fTWasser > m_fTWasserSoll + m_fTHysterese / 2.0 || m_fTVorlauf < m_fTWasser))
         m_enOpRequest = EnumOperation::Op_Aus;
       if (m_enOpRequest > EnumOperation::Op_Trinkwasser
-      && m_fTWasser < m_fTWasserSoll && m_fTVorlauf > m_fTWasser + m_fTHysterese)
+      && m_fTWasser < m_fTWasserSoll - m_fTHysterese / 2.0
+      && m_fTVorlauf > m_fTWasser + m_fTHysterese)
         m_enOpRequest = EnumOperation::Op_Trinkwasser;
-  
-      // Prüfung Anforderung Heizung
+
+      // Prüfung Anforderung "Trinkwasser Vorbereitung"
+      if (m_enOpRequest == EnumOperation::Op_TrinkwasserVorbereitung
+      && (m_fTWasser > m_fTWasserSoll + m_fTHysterese / 2.0 || m_fTVorlauf < m_fTWasser))
+        m_enOpRequest = EnumOperation::Op_Aus;
+      if (m_enOpRequest > EnumOperation::Op_TrinkwasserVorbereitung
+      && m_fTWasser < m_fTWasserSoll - m_fTHysterese / 2.0)
+        m_enOpRequest = EnumOperation::Op_TrinkwasserVorbereitung;
+
+      // Prüfung Anforderung "Heizung"
       if (m_enOpRequest == EnumOperation::Op_Heizung
-      && (m_fTHeizung > m_fTHeizungSoll + m_fTHysterese || m_fTVorlauf < m_fTHeizung))
+      && (m_fTHeizung > m_fTHeizungSoll + m_fTHysterese / 2.0 || m_fTVorlauf < m_fTHeizung))
         m_enOpRequest = EnumOperation::Op_Aus;
       if (m_enOpRequest > EnumOperation::Op_Heizung
-      && m_fTHeizung < m_fTHeizungSoll && m_fTVorlauf > m_fTHeizung + m_fTHysterese)
+      && m_fTHeizung < m_fTHeizungSoll - m_fTHysterese / 2.0
+      && m_fTVorlauf > m_fTHeizung + m_fTHysterese)
         m_enOpRequest = EnumOperation::Op_Heizung;
 
       if (m_enOpRequest == m_enOpStatus)
@@ -382,17 +393,19 @@ EnumResult TemperatureControl ()
       else
         m_oPumpe.SetUp (100, 100);
 
-      if (m_enOpRequest == EnumOperation::Op_Aus)
+      if (m_enOpRequest == EnumOperation::Op_Aus
+      ||  m_enOpRequest == EnumOperation::Op_TrinkwasserVorbereitung)
         m_oMischer1KH.Write (HIGH, LOW, true);
       else
         m_oMischer1KH.Write (LOW, HIGH, true);
-   
-      if (m_enOpRequest == EnumOperation::Op_Trinkwasser)
+
+      if (m_enOpRequest == EnumOperation::Op_Trinkwasser
+      ||  m_enOpRequest == EnumOperation::Op_TrinkwasserVorbereitung)
         m_oMischer2WH.Write (HIGH, LOW, true);
       else if (m_enOpRequest == EnumOperation::Op_Heizung)
         m_oMischer2WH.Write (LOW, HIGH, true);
     }
-      
+
     if (!m_oMischer1KH.IsActive() && !m_oMischer2WH.IsActive())
     {
       if (m_enOpRequest != EnumOperation::OpNone)
@@ -401,7 +414,7 @@ EnumResult TemperatureControl ()
     }
 
     m_oPumpe.Write ();
-    
+
     enResult = EnumResult::SUCCESS;
   }
 
@@ -449,7 +462,7 @@ void UpdateUI (EnumButton i_enButton)
   static EnumScreen s_enEditScreen    = EnumScreen::ScrNone;
   static bool       s_bSettingScreen  = false;
   EnumScreen enScreenCurrent = m_enScreen;
-  
+
   if (i_enButton != EnumButton::BtnNone)
     m_tLastMenuChange = millis ();
   else if (millis() - m_tLastMenuChange > mc_tTimeoutMenu)
@@ -462,7 +475,7 @@ void UpdateUI (EnumButton i_enButton)
   }
 
   bool bEditStart = false;
-  
+
   //----------------------------------------
   // navigation
   switch (m_enScreen)
@@ -491,9 +504,9 @@ void UpdateUI (EnumButton i_enButton)
       break;
     default:
       break;
-    }  
+    }
     break;
-    
+
   case EnumScreen::ScrSet00:
     switch (i_enButton) {
     case EnumButton::BtnMenu:  m_enScreen = EnumScreen::ScrService00;     break;
@@ -535,7 +548,7 @@ void UpdateUI (EnumButton i_enButton)
     default: break;
     }
     break;
-  
+
   case EnumScreen::ScrService01_SensorSuche:
   case EnumScreen::ScrService02_SettingsReset:
     switch (i_enButton) {
@@ -576,7 +589,7 @@ void UpdateUI (EnumButton i_enButton)
   {
     s_enEditScreen   = EnumScreen::ScrNone;
     s_bSettingScreen = false;
-    m_oEditScreen.Update (CEditScreen::EnumAction::Clear);    
+    m_oEditScreen.Update (CEditScreen::EnumAction::Clear);
   }
 #ifdef DEBUG_PROGRAM
   Serial << F("bSettingScreen=") << s_bSettingScreen << endl;
@@ -585,32 +598,35 @@ void UpdateUI (EnumButton i_enButton)
   //----------------------------------------
   // view content
   EnumOperation enStatus = EnumOperation::OpNone;
-  
+
   switch (m_enScreen)
   {
   case EnumScreen::ScrHome00_Status:
-    if (m_enResult != EnumResult::InProgress) 
+    if (m_enResult != EnumResult::InProgress)
     {
       m_oDisplay.clear ();
       m_oDisplay.setCursor(0,0);
       m_oDisplay << F("Fehler ") << m_enResult;
       m_oDisplay.setCursor(0,1);
-    } 
-    else if (m_enOpRequest != EnumOperation::OpNone) 
+    }
+    else if (m_enOpRequest != EnumOperation::OpNone)
     {
       DisplayPrint (F("Wechsel zu"), 0);
       enStatus = m_enOpRequest;
     }
-    else 
+    else
     {
       DisplayPrint (F("Betrieb"), 0);
       enStatus = m_enOpStatus;
     }
-    
+
     switch (enStatus)
     {
     case EnumOperation::Op_Trinkwasser:
       DisplayPrintRow (2, F("Erwaerm.Trinkwas"));
+      break;
+    case EnumOperation::Op_TrinkwasserVorbereitung:
+      DisplayPrintRow (2, F("Vorbereit.Trinkw"));
       break;
     case EnumOperation::Op_Heizung:
       DisplayPrintRow (2, F("Heiz.Unterstuetz"));
@@ -683,7 +699,7 @@ void UpdateUI (EnumButton i_enButton)
       m_oEditScreen.Show (F("S.3 Adresse"), CEditScreen::EnumDataType::BYTES, m_aabyTempDS18B20Addr[2], 0, 0, 8, 0, true);
     break;
    break;
-   
+
   case EnumScreen::ScrService00:
     DisplayPrint (F("Service-"), F("Funktionen"));
     break;
@@ -693,7 +709,7 @@ void UpdateUI (EnumButton i_enButton)
   case EnumScreen::ScrService02_SettingsReset:
     DisplayPrint (F("Einstellungen"), F("loeschen"));
     break;
-  
+
   default:
     break;
   }
@@ -741,7 +757,7 @@ EnumResult SettingsRead ()  // read from EEPROM
   Serial << F("SettingsRead(), starting at 0x") << _HEX(uiPos) << endl;
 #endif
   EnumResult enResult = EnumResult::InProgress;
-  
+
   EEPROM.get (uiPos, m_fTWasserSoll);
   if (isnan(m_fTWasserSoll)
   ||  m_fTWasserSoll < mc_fTemperaturMin
@@ -751,7 +767,7 @@ EnumResult SettingsRead ()  // read from EEPROM
     enResult = EnumResult::Error_SettingsInvalid;
   }
   uiPos += sizeof(float);
-  
+
   EEPROM.get (uiPos, m_fTHeizungSoll);
   if (isnan(m_fTHeizungSoll)
   ||  m_fTHeizungSoll < mc_fTemperaturMin
@@ -761,7 +777,7 @@ EnumResult SettingsRead ()  // read from EEPROM
     enResult = EnumResult::Error_SettingsInvalid;
   }
   uiPos += sizeof(float);
-  
+
   EEPROM.get (uiPos, m_fTHysterese);
   if (isnan(m_fTHysterese)
   ||  m_fTHysterese < mc_fHystereseMin
@@ -771,7 +787,7 @@ EnumResult SettingsRead ()  // read from EEPROM
     enResult = EnumResult::Error_SettingsInvalid;
   }
   uiPos += sizeof(float);
-  
+
   EEPROM.get (uiPos, m_uiMischerStellzeit);
   if (m_uiMischerStellzeit > mc_uiMischerStellzeitMax)
   {
@@ -779,7 +795,7 @@ EnumResult SettingsRead ()  // read from EEPROM
     enResult = EnumResult::Error_SettingsInvalid;
   }
   uiPos += sizeof(int);
-  
+
   EEPROM.get (uiPos, m_byPumpeLaufzeit);
   if (m_byPumpeLaufzeit > mc_byPumpeLaufzeitMax)
   {
@@ -790,7 +806,7 @@ EnumResult SettingsRead ()  // read from EEPROM
 
   uiPos &= 0xFFF0;
   uiPos += 0x10;
-  
+
   for (byte byxCnt = 0; byxCnt < TEMPCOUNT; byxCnt++)
   {
 #ifdef DEBUG_PROGRAM
@@ -819,7 +835,7 @@ EnumResult SettingsRead ()  // read from EEPROM
   }
   if (enResult == EnumResult::InProgress)
     enResult = EnumResult::SUCCESS;
-    
+
   return enResult;
 }
 
@@ -832,7 +848,7 @@ void SettingsWrite ()  // write to EEPROM
 #ifdef DEBUG_PROGRAM
   Serial << F("SettingsWrite(), starting at 0x") << _HEX(uiPos) << endl;
 #endif
-  
+
   EEPROM.put (uiPos, m_fTWasserSoll);
   uiPos += sizeof(float);
   EEPROM.put (uiPos, m_fTHeizungSoll);
@@ -846,7 +862,7 @@ void SettingsWrite ()  // write to EEPROM
 
   uiPos &= 0xFFF0;
   uiPos += 0x10;
-  
+
   for (byte byxCnt = 0; byxCnt < TEMPCOUNT; byxCnt++)
   {
 #ifdef DEBUG_PROGRAM
@@ -876,7 +892,7 @@ void SettingsReset ()  // write to EEPROM
     EEPROM.update (uiPos++, 0xFF);
   }
   while (uiPos < 0x200);
-  
+
   DisplayPrint (F("Einstellungen"), F("geloescht."));
   delay (2000);
 }
@@ -885,7 +901,7 @@ void SettingsReset ()  // write to EEPROM
 EnumResult Service_TempSensorSearch ()
 {
   EnumResult enResult = EnumResult::InProgress;
-  
+
   m_oOneWire.reset_search();
   DisplayPrint (F("Suche nach"), F("Temp.sensoren"));
 
