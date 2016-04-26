@@ -1,3 +1,5 @@
+#define DEBUG_PROGRAM
+
 #include <Streaming.h>
 #include <LiquidCrystal_I2C.h>
 #include <OneWire.h>
@@ -114,7 +116,7 @@ byte                m_aabyTempDS18B20Addr[TEMPCOUNT][8];
 //----------------------------------------------------------------------------
 bool                m_bInit           = false;
 EnumResult          m_enResult        = EnumResult::InProgress;
-EnumOperation       m_enOpStatus      = EnumOperation::OpNone;
+EnumOperation       m_enOpStatus      = EnumOperation::Op_Aus;
 EnumOperation       m_enOpRequest     = EnumOperation::OpNone;
 EnumAction          m_enAction        = EnumAction::ActNone;
 unsigned long       m_tWatchdog       = 0;
@@ -130,8 +132,8 @@ CEditScreen         m_oEditScreen (&m_oDisplay, 16, true);
 OneWire             m_oOneWire (DI_TempDS18B20);
 CTempDS18B20*       m_apoTempSensor[TEMPCOUNT];
 COutputPWM          m_oPumpe (DO_Pumpe, false, 0, 100);
-CDoubleOutput       m_oMischer1KH (DO_Mischer1_Kreis,  DO_Mischer1_Heizen,  false, m_uiMischerStellzeit * 1000, m_uiMischerStellzeit * 1000);
-CDoubleOutput       m_oMischer2WH (DO_Mischer2_Wasser, DO_Mischer2_Heizung, false, m_uiMischerStellzeit * 1000, m_uiMischerStellzeit * 1000);
+CDoubleOutput       m_oMischer1KH (DO_Mischer1_Kreis,  DO_Mischer1_Heizen,  false, 0, 0);
+CDoubleOutput       m_oMischer2WH (DO_Mischer2_Wasser, DO_Mischer2_Heizung, false, 0, 0);
 float               m_fTVorlauf       = 0.0;
 float               m_fTWasser        = 0.0;
 float               m_fTHeizung       = 0.0;
@@ -167,8 +169,10 @@ void DisplayPrint (const __FlashStringHelper* i_poLine1,
 //------------------------------------------------------------------------------
 void setup() 
 {
+#ifdef DEBUG_PROGRAM
   Serial.begin (9600);
-    
+#endif
+
   //--------------------------------------
   pinMode (DI_Button, INPUT);
   
@@ -198,12 +202,16 @@ void setup()
     }
     else
       m_enResult = EnumResult::Error_TempSensor_Create;
+#ifdef DEBUG_PROGRAM
     Serial << F("new Temp sensor DS18B20, result=") << enResultDS18B20 << endl;
+#endif
   }
   if (m_enResult != EnumResult::SUCCESS) return;
 
   //--------------------------------------
-  m_oPumpe.Set (m_byPumpeLaufzeit, 100);
+  m_oMischer1KH.SetUp ((long)m_uiMischerStellzeit * 1000L, (long)m_uiMischerStellzeit * 1000L);
+  m_oMischer2WH.SetUp ((long)m_uiMischerStellzeit * 1000L, (long)m_uiMischerStellzeit * 1000L);
+  m_oPumpe.SetUp (m_byPumpeLaufzeit, 100);
 
   //--------------------------------------
   DisplayPrint (F("Initialisierung"), F("abgeschlossen."));
@@ -211,7 +219,9 @@ void setup()
   m_bInit = true;
   delay(5000);
   m_oDisplay.clear ();
+#ifdef DEBUG_PROGRAM
   Serial << F("setup completed.") << endl;
+#endif
 }
 
 //------------------------------------------------------------------------------
@@ -245,12 +255,13 @@ void loop()
   
   EnumButton enButton = EnumButton::BtnNone;
   ButtonRead (enButton);
-  if (enButton != m_enLastButton
-  &&  enButton != EnumButton::BtnNone
+  if ((enButton != m_enLastButton && enButton != EnumButton::BtnNone)
   ||  tTime - m_tLastUpdateUI > mc_tIntervalUpdateUI)
   {
+#ifdef DEBUG_PROGRAM
     if (m_enResult != EnumResult::InProgress)
       Serial << F("Error=") << m_enResult << endl;
+#endif
     UpdateUI (enButton);
     m_tLastUpdateUI = tTime;
   }
@@ -267,11 +278,15 @@ void loop()
   {
   case EnumAction::ActSvcSensorSearch:
     enResult = Service_TempSensorSearch ();
+#ifdef DEBUG_PROGRAM
     if (enResult != EnumResult::SUCCESS)
       Serial << F("Service_TempSensorSearch: result=") << enResult << endl;
+#endif
     break;
   case EnumAction::ActSvcSettingsReset:
     SettingsReset ();
+    break;
+  default:
     break;
   }
   m_enAction = EnumAction::ActNone;
@@ -298,7 +313,6 @@ EnumResult TemperatureControl ()
     enResultDS18B20 = m_apoTempSensor[s_byxSensor]->ReadTemp (false, fTemp);
     if (enResultDS18B20 == CTempDS18B20::EnumResult::SUCCESS)
     {
-      Serial << F("TemperatureControl() sensor=") << (s_byxSensor+1) << F(" temp=") << fTemp << endl;
       if (s_byxSensor == 0) m_fTVorlauf = fTemp;
       if (s_byxSensor == 1) m_fTWasser  = fTemp;
       if (s_byxSensor == 2) m_fTHeizung = fTemp;
@@ -320,43 +334,53 @@ EnumResult TemperatureControl ()
     
     if (m_fTHysterese <  1.0) m_fTHysterese =  1.0;
     if (m_fTHysterese > 10.0) m_fTHysterese = 10.0;
-    bool bVersorgung = m_fTVorlauf > m_fTWasser || m_fTVorlauf > m_fTHeizung;
 
+#ifdef DEBUG_PROGRAM
     Serial << F("TV=") << m_fTVorlauf << F(", TW=") << m_fTWasser << F(", TH=") << m_fTHeizung << endl;
     Serial << F("alt: Status=") << m_enOpStatus << ", Anforderung=" << m_enOpRequest << endl;
+#endif
     if (m_enOpRequest == EnumOperation::OpNone)
-    {      
+    {
+      m_enOpRequest = m_enOpStatus;
+      
       // Prüfung Anforderung Trinkwasser
-      if (m_enOpStatus == EnumOperation::Op_Trinkwasser && m_fTWasser < m_fTWasserSoll)
-        m_enOpStatus = EnumOperation::Op_Aus;
-      if (m_enOpStatus > EnumOperation::Op_Trinkwasser && m_fTWasser > m_fTWasserSoll + m_fTHysterese)
-        m_enOpStatus = EnumOperation::Op_Trinkwasser;
+      if (m_enOpRequest == EnumOperation::Op_Trinkwasser
+      && (m_fTWasser > m_fTWasserSoll + m_fTHysterese || m_fTVorlauf < m_fTWasser))
+        m_enOpRequest = EnumOperation::Op_Aus;
+      if (m_enOpRequest > EnumOperation::Op_Trinkwasser
+      && m_fTWasser < m_fTWasserSoll && m_fTVorlauf > m_fTWasser + m_fTHysterese)
+        m_enOpRequest = EnumOperation::Op_Trinkwasser;
   
       // Prüfung Anforderung Heizung
-      if (m_enOpStatus == EnumOperation::Op_Heizung && m_fTHeizung < m_fTHeizungSoll)
-        m_enOpStatus = EnumOperation::Op_Aus;
-      if (m_enOpStatus > EnumOperation::Op_Heizung && m_fTHeizung > m_fTHeizungSoll + m_fTHysterese)
-        m_enOpStatus = EnumOperation::Op_Heizung;
-
-      // Prüfung Versorgung
-      if (bVersorgung)
-        m_enOpRequest = m_enOpStatus;
-      else
+      if (m_enOpRequest == EnumOperation::Op_Heizung
+      && (m_fTHeizung > m_fTHeizungSoll + m_fTHysterese || m_fTVorlauf < m_fTHeizung))
         m_enOpRequest = EnumOperation::Op_Aus;
-      bNewRequest = true;
+      if (m_enOpRequest > EnumOperation::Op_Heizung
+      && m_fTHeizung < m_fTHeizungSoll && m_fTVorlauf > m_fTHeizung + m_fTHysterese)
+        m_enOpRequest = EnumOperation::Op_Heizung;
+
+      if (m_enOpRequest == m_enOpStatus)
+        m_enOpRequest = EnumOperation::OpNone;
+      else
+        bNewRequest = true;
     }
 
+#ifdef DEBUG_PROGRAM
     Serial << F("neu: Status=") << m_enOpStatus << ", Anforderung=" << m_enOpRequest << endl;
+#endif
 
     m_oMischer1KH.Write ();
     m_oMischer2WH.Write ();
 
     if (m_enOpRequest != EnumOperation::OpNone && bNewRequest)
     {
+#ifdef DEBUG_PROGRAM
+      Serial << F("new request: ") << m_enOpRequest << endl;
+#endif
       if (m_enOpRequest == EnumOperation::Op_Aus)
-        m_oPumpe.Set (m_byPumpeLaufzeit, 100);
+        m_oPumpe.SetUp (m_byPumpeLaufzeit, 100);
       else
-        m_oPumpe.Set (100, 100);
+        m_oPumpe.SetUp (100, 100);
 
       if (m_enOpRequest == EnumOperation::Op_Aus)
         m_oMischer1KH.Write (HIGH, LOW, true);
@@ -370,7 +394,11 @@ EnumResult TemperatureControl ()
     }
       
     if (!m_oMischer1KH.IsActive() && !m_oMischer2WH.IsActive())
+    {
+      if (m_enOpRequest != EnumOperation::OpNone)
+        m_enOpStatus = m_enOpRequest;
       m_enOpRequest = EnumOperation::OpNone;
+    }
 
     m_oPumpe.Write ();
     
@@ -413,7 +441,9 @@ void ButtonReset ()
 //------------------------------------------------------------------------------
 void UpdateUI (EnumButton i_enButton)
 {
+#ifdef DEBUG_PROGRAM
   Serial << F("UpdateUI() CurrentScreen=") << m_enScreen << F(", Button=") << i_enButton << F(", ");
+#endif
 
   //static EnumScreen s_enLastScreen    = EnumScreen::ScrHome00_Status;
   static EnumScreen s_enEditScreen    = EnumScreen::ScrNone;
@@ -424,8 +454,10 @@ void UpdateUI (EnumButton i_enButton)
     m_tLastMenuChange = millis ();
   else if (millis() - m_tLastMenuChange > mc_tTimeoutMenu)
   {
+#ifdef DEBUG_PROGRAM
     if (m_enScreen != EnumScreen::ScrHome00_Status)
       Serial << F("Timeout, ");
+#endif
     m_enScreen = EnumScreen::ScrHome00_Status;
   }
 
@@ -530,7 +562,9 @@ void UpdateUI (EnumButton i_enButton)
   }
 
   bool bScreenChanged = (m_enScreen != enScreenCurrent);
+#ifdef DEBUG_PROGRAM
   Serial << F("NewScreen=") << m_enScreen << F(", ");
+#endif
 
   if (m_enScreen >= EnumScreen::ScrSettingFirst
   &&  m_enScreen <= EnumScreen::ScrSettingLast
@@ -544,8 +578,10 @@ void UpdateUI (EnumButton i_enButton)
     s_bSettingScreen = false;
     m_oEditScreen.Update (CEditScreen::EnumAction::Clear);    
   }
+#ifdef DEBUG_PROGRAM
   Serial << F("bSettingScreen=") << s_bSettingScreen << endl;
-  
+#endif
+
   //----------------------------------------
   // view content
   EnumOperation enStatus = EnumOperation::OpNone;
@@ -587,7 +623,7 @@ void UpdateUI (EnumButton i_enButton)
     break;
   case EnumScreen::ScrHome01_TempOverview:
     DisplayPrint (F("T:Vorl Wass Heiz"), 0);
-    m_oDisplay.setCursor(0,2);
+    m_oDisplay.setCursor(1,1);
     m_oDisplay << String(m_fTVorlauf, 1).padLeftC(5)
                << String(m_fTWasser , 1).padLeftC(5)
                << String(m_fTHeizung, 1).padLeftC(5);
@@ -701,7 +737,9 @@ void UpdateUI (EnumButton i_enButton)
 EnumResult SettingsRead ()  // read from EEPROM
 {
   unsigned int uiPos = 0x10;
+#ifdef DEBUG_PROGRAM
   Serial << F("SettingsRead(), starting at 0x") << _HEX(uiPos) << endl;
+#endif
   EnumResult enResult = EnumResult::InProgress;
   
   EEPROM.get (uiPos, m_fTWasserSoll);
@@ -755,18 +793,26 @@ EnumResult SettingsRead ()  // read from EEPROM
   
   for (byte byxCnt = 0; byxCnt < TEMPCOUNT; byxCnt++)
   {
+#ifdef DEBUG_PROGRAM
     Serial << F("Sensor ") << (byxCnt+1) << F(" reading from 0x") << String(uiPos, HEX);
+#endif
     for (byte byxByte = 0; byxByte < 8; byxByte++)
     {
       m_aabyTempDS18B20Addr[byxCnt][byxByte] = EEPROM.read (uiPos++);
     }
     byte byCRC = OneWire::crc8 (m_aabyTempDS18B20Addr[byxCnt], 7);
     if (byCRC == m_aabyTempDS18B20Addr[byxCnt][7])
+    {
+#ifdef DEBUG_PROGRAM
       Serial << F(" successful.") << endl;
+#endif
+    }
     else
     {
-      Serial << F(" CRC failure.") << endl;
       enResult = EnumResult::Error_SettingsInvalid;
+#ifdef DEBUG_PROGRAM
+      Serial << F(" CRC failure.") << endl;
+#endif
     }
     uiPos &= 0xFFF0;
     uiPos += 0x10;
@@ -783,7 +829,9 @@ EnumResult SettingsRead ()  // read from EEPROM
 void SettingsWrite ()  // write to EEPROM
 {
   unsigned int uiPos = 0x10;
+#ifdef DEBUG_PROGRAM
   Serial << F("SettingsWrite(), starting at 0x") << _HEX(uiPos) << endl;
+#endif
   
   EEPROM.put (uiPos, m_fTWasserSoll);
   uiPos += sizeof(float);
@@ -801,7 +849,9 @@ void SettingsWrite ()  // write to EEPROM
   
   for (byte byxCnt = 0; byxCnt < TEMPCOUNT; byxCnt++)
   {
+#ifdef DEBUG_PROGRAM
     Serial << F("Sensor ") << (byxCnt+1) << F(" writing to 0x") << String(uiPos, HEX) << endl;
+#endif
     for (byte byxByte = 0; byxByte < 8; byxByte++)
     {
       EEPROM.update(uiPos++, m_aabyTempDS18B20Addr[byxCnt][byxByte]);
@@ -817,7 +867,9 @@ void SettingsWrite ()  // write to EEPROM
 void SettingsReset ()  // write to EEPROM
 {
   unsigned int uiPos = 0x0;
+#ifdef DEBUG_PROGRAM
   Serial << F("SettingsReset(), starting at 0x") << _HEX(uiPos) << endl;
+#endif
 
   do
   {
@@ -881,9 +933,19 @@ EnumResult Service_TempSensorSearch ()
           m_oDisplay << F("CRC Fehler");
         else
         {
+#ifdef DEBUG_PROGRAM
           Serial << F("Sensor found.") << endl;
+#endif
           for (int ixCnt = 0; ixCnt < 8; ixCnt++)
+          {
             m_oDisplay << String(abyDevAddr[ixCnt], HEX).padLeftC(2, '0');
+#ifdef DEBUG_PROGRAM
+            Serial << String(abyDevAddr[ixCnt], HEX).padLeftC(2, '0');
+#endif
+          }
+#ifdef DEBUG_PROGRAM
+          Serial << endl;
+#endif
         }
       }
       else
